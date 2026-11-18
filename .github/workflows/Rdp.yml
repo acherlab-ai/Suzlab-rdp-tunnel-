@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "Tunnel session duration"
+        description: "SuzLab Tunnel Session Duration"
         required: true
         default: "3h"
         type: choice
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  suzlab-tunnel:
+  suzlab-demo:
     name: "SuzLab SSH Reverse Tunnel"
     runs-on: windows-latest
     timeout-minutes: 340
@@ -29,19 +29,29 @@ jobs:
       RDP_PORT: "3389"
 
     steps:
+      # ==========================================
+      # 01 - WELCOME
+      # ==========================================
+
       - name: "01 - SuzLab Welcome"
         shell: pwsh
         run: |
-          Write-Host "===================================="
-          Write-Host "       SUZLAB TUNNEL DEMO"
-          Write-Host "       SSH REVERSE TUNNEL"
-          Write-Host "===================================="
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "          SUZLAB TUNNEL"
+          Write-Host "          RDP DEMO SERVICE"
+          Write-Host "======================================"
           Write-Host "Host: $env:TUNNEL_HOST"
           Write-Host "SSH Port: $env:TUNNEL_PORT"
           Write-Host "RDP Port: $env:RDP_PORT"
           Write-Host "Duration: ${{ inputs.duration }}"
+          Write-Host "======================================"
 
-      - name: "02 - Configure RDP"
+      # ==========================================
+      # 02 - WINDOWS RDP
+      # ==========================================
+
+      - name: "02 - Configure Windows RDP"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -54,14 +64,28 @@ jobs:
             "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
             -Name UserAuthentication -Value 1
 
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name SecurityLayer -Value 2
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
           Set-Service TermService -StartupType Automatic
           Start-Service TermService
 
-          Write-Host "[OK] RDP enabled."
+          $rdp = Get-Service TermService
 
-      - name: "03 - Create RDP Account"
+          if ($rdp.Status -ne "Running") {
+            throw "RDP service failed to start."
+          }
+
+          Write-Host "[OK] Windows RDP ready."
+
+      # ==========================================
+      # 03 - RDP ACCOUNT
+      # ==========================================
+
+      - name: "03 - Create SuzLab Demo Account"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -100,21 +124,27 @@ jobs:
             -Group "Remote Desktop Users" `
             -Member "SUZLAB-DEMO"
 
-          "## SuzLab RDP Credentials" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "## SuzLab RDP Account" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Field | Value |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "|---|---|" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Username | SUZLAB-DEMO |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Password | $password |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
-          Write-Host "[OK] RDP account created."
+          Write-Host "[OK] Demo account created."
+
+      # ==========================================
+      # 04 - OPENSSH
+      # ==========================================
 
       - name: "04 - Install OpenSSH"
         shell: pwsh
         run: |
-          $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+          $ErrorActionPreference = "Stop"
 
-          if (-not $ssh) {
-            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability `
+              -Online `
+              -Name OpenSSH.Client~~~~0.0.1.0
           }
 
           if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
@@ -123,7 +153,11 @@ jobs:
 
           Write-Host "[OK] OpenSSH ready."
 
-      - name: "05 - Connect SuzLab Tunnel"
+      # ==========================================
+      # 05 - SSH ASKPASS
+      # ==========================================
+
+      - name: "05 - Prepare SuzLab Authentication"
         shell: pwsh
         env:
           SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
@@ -131,19 +165,40 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not $env:SUZLAB_TUNNEL_USER -or
-              -not $env:SUZLAB_TUNNEL_PASSWORD) {
-            throw "Missing SuzLab SSH credentials."
+          if ([string]::IsNullOrWhiteSpace($env:SUZLAB_TUNNEL_USER)) {
+            throw "Missing SUZLAB_TUNNEL_USER."
           }
 
-          $askpass = Join-Path $env:RUNNER_TEMP "suzlab-askpass.cmd"
+          if ([string]::IsNullOrWhiteSpace($env:SUZLAB_TUNNEL_PASSWORD)) {
+            throw "Missing SUZLAB_TUNNEL_PASSWORD."
+          }
+
+          $askpass = "$env:RUNNER_TEMP\suzlab-askpass.cmd"
 
           @'
           @echo off
           echo %SUZLAB_TUNNEL_PASSWORD%
           '@ | Set-Content $askpass -Encoding ASCII
 
-          $env:SSH_ASKPASS = $askpass
+          "SUZLAB_ASKPASS=$askpass" >> $env:GITHUB_ENV
+
+          Write-Host "[OK] Authentication helper prepared."
+
+      # ==========================================
+      # 06 - CONNECT TUNNEL
+      # ==========================================
+
+      - name: "06 - Connect SuzLab Reverse Tunnel"
+        shell: pwsh
+        env:
+          SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
+          SUZLAB_TUNNEL_PASSWORD: ${{ secrets.SUZLAB_TUNNEL_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $log = "$env:RUNNER_TEMP\suzlab-ssh.log"
+
+          $env:SSH_ASKPASS = $env:SUZLAB_ASKPASS
           $env:SSH_ASKPASS_REQUIRE = "force"
           $env:DISPLAY = "suzlab"
 
@@ -151,12 +206,13 @@ jobs:
             "-p", "2222",
             "-N",
             "-T",
+            "-E", $log,
             "-o", "BatchMode=no",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "PreferredAuthentications=password",
             "-o", "PubkeyAuthentication=no",
             "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveInterval=20",
             "-o", "ServerAliveCountMax=3",
             "-o", "StrictHostKeyChecking=accept-new",
             "-R", "0:localhost:3389",
@@ -167,8 +223,7 @@ jobs:
             -FilePath "ssh.exe" `
             -ArgumentList $sshArgs `
             -PassThru `
-            -NoNewWindow `
-            -RedirectStandardError "$env:RUNNER_TEMP\suzlab-ssh.log"
+            -NoNewWindow
 
           "SUZLAB_SSH_PID=$($process.Id)" >> $env:GITHUB_ENV
 
@@ -177,76 +232,121 @@ jobs:
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
 
+            $process.Refresh()
+
             if ($process.HasExited) {
-              Get-Content "$env:RUNNER_TEMP\suzlab-ssh.log"
-              throw "SuzLab SSH connection failed."
+              if (Test-Path $log) {
+                Get-Content $log -Tail 40
+              }
+
+              throw "SSH connection failed."
             }
 
-            $log = Get-Content "$env:RUNNER_TEMP\suzlab-ssh.log" -Raw -ErrorAction SilentlyContinue
+            $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
 
-            if ($log -match 'Allocated port (\d+) for remote forward') {
+            if ($content -match 'Allocated port (\d+) for remote forward') {
               $allocatedPort = $Matches[1]
               break
             }
           }
 
           if (-not $allocatedPort) {
-            throw "Tunnel port allocation not detected. Check server configuration."
+            Get-Content $log -Tail 40 -ErrorAction SilentlyContinue
+            throw "SuzLab did not return an allocated port."
           }
 
           "SUZLAB_ENDPOINT_PORT=$allocatedPort" >> $env:GITHUB_ENV
 
-          "## SuzLab Tunnel Connected" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "## SuzLab Tunnel" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Field | Value |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "|---|---|" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Host | tnl.suzlab.com |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| Port | $allocatedPort |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "| RDP | localhost:3389 |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
-          Write-Host "[OK] SuzLab Tunnel connected."
-          Write-Host "Allocated endpoint: $allocatedPort"
+          Write-Host "======================================"
+          Write-Host "SUZLAB TUNNEL CONNECTED"
+          Write-Host "Endpoint: tnl.suzlab.com:$allocatedPort"
+          Write-Host "======================================"
 
-      - name: "06 - Maintain Tunnel"
+      # ==========================================
+      # 07 - MAINTAIN SESSION
+      # ==========================================
+
+      - name: "07 - Maintain SuzLab Tunnel"
         shell: pwsh
         run: |
           $minutes = switch ("${{ inputs.duration }}") {
-            "1h" { 60 }
-            "3h" { 180 }
+            "1h"    { 60 }
+            "3h"    { 180 }
             "5h40m" { 340 }
             default { throw "Invalid duration." }
           }
 
           $end = (Get-Date).AddMinutes($minutes)
+          $log = "$env:RUNNER_TEMP\suzlab-ssh.log"
 
-          Write-Host "SuzLab endpoint: tnl.suzlab.com:$env:SUZLAB_ENDPOINT_PORT"
+          Write-Host "Endpoint: tnl.suzlab.com:$env:SUZLAB_ENDPOINT_PORT"
 
           while ((Get-Date) -lt $end) {
-            $remaining = $end - (Get-Date)
+            $process = Get-Process `
+              -Id $env:SUZLAB_SSH_PID `
+              -ErrorAction SilentlyContinue
 
-            if (-not (Get-Process -Id $env:SUZLAB_SSH_PID -ErrorAction SilentlyContinue)) {
-              throw "SuzLab Tunnel disconnected."
+            if (-not $process) {
+              Write-Host "[ERROR] SSH process stopped."
+
+              if (Test-Path $log) {
+                Get-Content $log -Tail 40
+              }
+
+              throw "SuzLab SSH tunnel disconnected."
             }
 
-            Write-Host "[$(Get-Date -Format HH:mm:ss)] Active - $([int]$remaining.TotalMinutes) minutes remaining"
+            $remaining = $end - (Get-Date)
 
-            Start-Sleep -Seconds 15
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] Tunnel active | $([int]$remaining.TotalMinutes) minutes remaining"
+
+            Start-Sleep -Seconds 10
           }
 
-          Write-Host "Session expired."
+          Write-Host "[SuzLab] Session expired."
 
-      - name: "07 - Cleanup"
+      # ==========================================
+      # 08 - CLEANUP
+      # ==========================================
+
+      - name: "08 - Cleanup SuzLab Session"
         if: always()
         shell: pwsh
         run: |
           Write-Host "[SuzLab] Cleaning up..."
 
           if ($env:SUZLAB_SSH_PID) {
-            Stop-Process -Id $env:SUZLAB_SSH_PID -Force -ErrorAction SilentlyContinue
+            Stop-Process `
+              -Id $env:SUZLAB_SSH_PID `
+              -Force `
+              -ErrorAction SilentlyContinue
           }
 
-          Disable-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue
+          Disable-LocalUser `
+            -Name "SUZLAB-DEMO" `
+            -ErrorAction SilentlyContinue
 
-          Remove-Item "$env:RUNNER_TEMP\suzlab-askpass.cmd" -Force -ErrorAction SilentlyContinue
-          Remove-Item "$env:RUNNER_TEMP\suzlab-ssh.log" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:RUNNER_TEMP\suzlab-askpass.cmd" `
+            -Force -ErrorAction SilentlyContinue
 
           Write-Host "[SuzLab] Cleanup completed."
+
+      # ==========================================
+      # 09 - DEBUG LOG
+      # ==========================================
+
+      - name: "09 - Upload SSH Diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suzlab-tunnel-diagnostics
+          path: ${{ runner.temp }}/suzlab-ssh.log
+          if-no-files-found: ignore
+          retention-days: 1
