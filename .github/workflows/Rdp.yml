@@ -40,7 +40,7 @@ jobs:
           Write-Host "Host: $env:TUNNEL_HOST`:$env:TUNNEL_PORT | Duration: ${{ inputs.duration }}"
 
       # ==========================================
-      # 02 - WINDOWS RDP (TỐI ƯU TCP OVER TUNNEL)
+      # 02 - WINDOWS RDP (TỐI ƯU TCP & CHỐNG SLEEP)
       # ==========================================
       - name: "02 - Configure Windows RDP"
         shell: pwsh
@@ -54,8 +54,12 @@ jobs:
           Set-ItemProperty -Path $rdpTcpPath -Name "UserAuthentication" -Value 1
           Set-ItemProperty -Path $rdpTcpPath -Name "SecurityLayer" -Value 2
 
-          # Ép RDP chạy thuần TCP (1 = TCP only) để mượt qua SSH Tunnel
+          # Ép RDP chạy thuần TCP (1 = TCP only) để không bị đứng hình qua SSH Tunnel
           New-ItemProperty -Path $rdpTcpPath -Name "SelectTransport" -Value 1 -PropertyType DWord -Force | Out-Null
+
+          # Tắt chế độ ngủ của Windows trong phiên dài
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-Service TermService -StartupType Automatic
@@ -157,15 +161,22 @@ jobs:
           Write-Host "[OK] Authentication helper prepared."
 
       # ==========================================
-      # 06 - CONNECT TUNNEL (ĐỌC LOG KHÔNG KHÓA FILE)
+      # 06 - CONNECT & MAINTAIN TUNNEL (CHUNG 1 STEP)
       # ==========================================
-      - name: "06 - Connect SuzLab Reverse Tunnel"
+      - name: "06 - Connect & Maintain SuzLab Tunnel"
         shell: pwsh
         env:
           SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
           SUZLAB_TUNNEL_PASSWORD: ${{ secrets.SUZLAB_TUNNEL_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+
+          $minutes = switch ("${{ inputs.duration }}") {
+            "1h"    { 60 }
+            "3h"    { 180 }
+            "5h40m" { 340 }
+            default { throw "Invalid duration." }
+          }
 
           function Read-LogSafe {
             param([string]$Path)
@@ -193,7 +204,6 @@ jobs:
           $env:SSH_ASKPASS_REQUIRE = "force"
           $env:DISPLAY = "suzlab:0"
 
-          # Bỏ -E để tránh ssh.exe khóa độc quyền file log; dùng RedirectStandardError thay thế
           $sshArgs = @(
             "-v",
             "-p", $env:TUNNEL_PORT,
@@ -214,60 +224,73 @@ jobs:
             "$($env:SUZLAB_TUNNEL_USER)@$($env:TUNNEL_HOST)"
           )
 
-          $process = Start-Process `
-            -FilePath "ssh.exe" `
-            -ArgumentList $sshArgs `
-            -RedirectStandardInput $emptyIn `
-            -RedirectStandardOutput $outLog `
-            -RedirectStandardError $errLog `
-            -WindowStyle Hidden `
-            -PassThru
+          function Start-SuzLabTunnel {
+            Remove-Item $errLog, $outLog -Force -ErrorAction SilentlyContinue
 
-          "SUZLAB_SSH_PID=$($process.Id)" >> $env:GITHUB_ENV
+            $proc = Start-Process `
+              -FilePath "ssh.exe" `
+              -ArgumentList $sshArgs `
+              -RedirectStandardInput $emptyIn `
+              -RedirectStandardOutput $outLog `
+              -RedirectStandardError $errLog `
+              -WindowStyle Hidden `
+              -PassThru
 
-          $endpoint = $null
-          $forwardConfirmed = $false
+            $resolvedEndpoint = $null
+            $forwardOk = $false
 
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 1
-            $process.Refresh()
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $proc.Refresh()
 
-            $combined = (Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog)
+              $combined = (Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog)
 
-            if ($process.HasExited) {
-              Write-Host "[ERROR] SSH exited with code $($process.ExitCode)"
-              Write-Host $combined
-              throw "SSH connection failed."
+              if ($proc.HasExited) {
+                Write-Host "[ERROR] SSH exited with code $($proc.ExitCode)"
+                Write-Host $combined
+                return $null
+              }
+
+              if ($combined -match 'Allocated port (\d+) for remote forward' -and $Matches[1] -ne $env:TUNNEL_PORT) {
+                $resolvedEndpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
+                break
+              }
+
+              if ($combined -match 'tnl\.suzlab\.com:(\d+)' -and $Matches[1] -ne $env:TUNNEL_PORT) {
+                $resolvedEndpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
+                break
+              }
+
+              if ($combined -match 'remote forward success') {
+                $forwardOk = $true
+              }
+
+              if ($forwardOk -and $i -ge 2) {
+                $resolvedEndpoint = "$($env:TUNNEL_HOST) (dùng port trên dashboard SuzLab)"
+                break
+              }
             }
 
-            if ($combined -match 'Allocated port (\d+) for remote forward') {
-              $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
-              break
+            if (-not $resolvedEndpoint) {
+              Write-Host "[ERROR] Timeout waiting for tunnel. Logs:"
+              Write-Host ((Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog))
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              return $null
             }
 
-            if ($combined -match 'tnl\.suzlab\.com:(\d+)') {
-              $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
-              break
-            }
-
-            if ($combined -match 'remote forward success') {
-              $forwardConfirmed = $true
-            }
-
-            # Nếu server đã báo forward thành công nhưng dùng port cố định trên web dashboard
-            if ($forwardConfirmed -and $i -ge 3) {
-              $endpoint = "$($env:TUNNEL_HOST) (xem port trên dashboard)"
-              break
+            return @{
+              Process  = $proc
+              Endpoint = $resolvedEndpoint
             }
           }
 
-          if (-not $endpoint) {
-            Write-Host "[ERROR] Timeout waiting for tunnel. Logs:"
-            Write-Host ((Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog))
-            throw "SuzLab tunnel did not confirm port forwarding."
+          $session = Start-SuzLabTunnel
+          if (-not $session) {
+            throw "Initial SuzLab SSH tunnel connection failed."
           }
 
-          "SUZLAB_ENDPOINT=$endpoint" >> $env:GITHUB_ENV
+          $process = $session.Process
+          $endpoint = $session.Endpoint
 
           @(
             "## SuzLab Tunnel Endpoint"
@@ -282,56 +305,53 @@ jobs:
           Write-Host "Endpoint: $endpoint"
           Write-Host "======================================"
 
-      # ==========================================
-      # 07 - MAINTAIN SESSION
-      # ==========================================
-      - name: "07 - Maintain SuzLab Tunnel"
-        shell: pwsh
-        run: |
-          $minutes = switch ("${{ inputs.duration }}") {
-            "1h"    { 60 }
-            "3h"    { 180 }
-            "5h40m" { 340 }
-            default { throw "Invalid duration." }
-          }
-
           $end = (Get-Date).AddMinutes($minutes)
-          Write-Host "Active Endpoint: $env:SUZLAB_ENDPOINT"
 
-          while ((Get-Date) -lt $end) {
-            $process = Get-Process -Id $env:SUZLAB_SSH_PID -ErrorAction SilentlyContinue
+          try {
+            while ((Get-Date) -lt $end) {
+              $process.Refresh()
 
-            if (-not $process) {
-              throw "SuzLab SSH tunnel disconnected unexpectedly."
+              if ($process.HasExited) {
+                Write-Host "[WARN] SSH tunnel dropped (exit code $($process.ExitCode)). Reconnecting in 3s..."
+                Start-Sleep -Seconds 3
+
+                $retry = Start-SuzLabTunnel
+                if (-not $retry) {
+                  throw "Failed to reconnect SuzLab SSH tunnel."
+                }
+                $process = $retry.Process
+                Write-Host "[OK] Reconnected: $($retry.Endpoint)"
+              }
+
+              $remaining = [int]($end - (Get-Date)).TotalMinutes
+              Write-Host "[$(Get-Date -Format HH:mm:ss)] Tunnel active | $remaining min remaining"
+
+              Start-Sleep -Seconds 30
             }
 
-            $remaining = [int]($end - (Get-Date)).TotalMinutes
-            Write-Host "[$(Get-Date -Format HH:mm:ss)] Tunnel active | $remaining min remaining"
-
-            Start-Sleep -Seconds 30
+            Write-Host "[SuzLab] Session expired."
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
           }
 
-          Write-Host "[SuzLab] Session expired."
-
       # ==========================================
-      # 08 - CLEANUP
+      # 07 - CLEANUP
       # ==========================================
-      - name: "08 - Cleanup SuzLab Session"
+      - name: "07 - Cleanup SuzLab Session"
         if: always()
         shell: pwsh
         run: |
-          if ($env:SUZLAB_SSH_PID) {
-            Stop-Process -Id $env:SUZLAB_SSH_PID -Force -ErrorAction SilentlyContinue
-          }
-
+          Get-Process -Name "ssh" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Disable-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue
           Remove-Item "$env:RUNNER_TEMP\suzlab-askpass.cmd", "$env:RUNNER_TEMP\suzlab-empty.in" -Force -ErrorAction SilentlyContinue
           Write-Host "[SuzLab] Cleanup completed."
 
       # ==========================================
-      # 09 - DEBUG LOG (CHỈ UPLOAD KHI LỖI)
+      # 08 - DEBUG LOG (CHỈ UPLOAD KHI LỖI)
       # ==========================================
-      - name: "09 - Upload SSH Diagnostics"
+      - name: "08 - Upload SSH Diagnostics"
         if: failure()
         uses: actions/upload-artifact@v4
         with:
