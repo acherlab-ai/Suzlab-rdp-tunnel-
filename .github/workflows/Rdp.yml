@@ -54,7 +54,7 @@ jobs:
           Set-ItemProperty -Path $rdpTcpPath -Name "UserAuthentication" -Value 1
           Set-ItemProperty -Path $rdpTcpPath -Name "SecurityLayer" -Value 2
 
-          # Ép RDP chạy thuần TCP (1 = TCP only) để không bị khựng khi qua SSH Tunnel
+          # Ép RDP chạy thuần TCP (1 = TCP only) để mượt qua SSH Tunnel
           New-ItemProperty -Path $rdpTcpPath -Name "SelectTransport" -Value 1 -PropertyType DWord -Force | Out-Null
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
@@ -132,7 +132,7 @@ jobs:
           Write-Host "[OK] OpenSSH ready."
 
       # ==========================================
-      # 05 - SSH ASKPASS (AN TOÀN KÝ TỰ ĐẶC BIỆT)
+      # 05 - SSH ASKPASS
       # ==========================================
       - name: "05 - Prepare SuzLab Authentication"
         shell: pwsh
@@ -157,7 +157,7 @@ jobs:
           Write-Host "[OK] Authentication helper prepared."
 
       # ==========================================
-      # 06 - CONNECT TUNNEL (TÁCH CONSOLE & BẮT PORT)
+      # 06 - CONNECT TUNNEL (ĐỌC LOG KHÔNG KHÓA FILE)
       # ==========================================
       - name: "06 - Connect SuzLab Reverse Tunnel"
         shell: pwsh
@@ -167,7 +167,24 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $log = "$env:RUNNER_TEMP\suzlab-ssh.log"
+          function Read-LogSafe {
+            param([string]$Path)
+            if (-not (Test-Path $Path)) { return "" }
+            $fs = $null
+            $sr = $null
+            try {
+              $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+              $sr = New-Object System.IO.StreamReader($fs)
+              return $sr.ReadToEnd()
+            } catch {
+              return ""
+            } finally {
+              if ($sr) { $sr.Dispose() }
+              if ($fs) { $fs.Dispose() }
+            }
+          }
+
+          $errLog = "$env:RUNNER_TEMP\suzlab-ssh-err.log"
           $outLog = "$env:RUNNER_TEMP\suzlab-ssh-out.log"
           $emptyIn = "$env:RUNNER_TEMP\suzlab-empty.in"
           New-Item -Path $emptyIn -ItemType File -Force | Out-Null
@@ -176,12 +193,12 @@ jobs:
           $env:SSH_ASKPASS_REQUIRE = "force"
           $env:DISPLAY = "suzlab:0"
 
+          # Bỏ -E để tránh ssh.exe khóa độc quyền file log; dùng RedirectStandardError thay thế
           $sshArgs = @(
             "-v",
             "-p", $env:TUNNEL_PORT,
             "-N",
             "-T",
-            "-E", $log,
             "-o", "BatchMode=no",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "PreferredAuthentications=password,keyboard-interactive",
@@ -197,60 +214,72 @@ jobs:
             "$($env:SUZLAB_TUNNEL_USER)@$($env:TUNNEL_HOST)"
           )
 
-          # Dùng -WindowStyle Hidden + RedirectStandardInput để cắt CONIN$, ép SSH gọi ASKPASS ngay lập tức
           $process = Start-Process `
             -FilePath "ssh.exe" `
             -ArgumentList $sshArgs `
             -RedirectStandardInput $emptyIn `
             -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog `
             -WindowStyle Hidden `
             -PassThru
 
           "SUZLAB_SSH_PID=$($process.Id)" >> $env:GITHUB_ENV
 
-          $allocatedPort = $null
+          $endpoint = $null
+          $forwardConfirmed = $false
 
-          for ($i = 0; $i -lt 45; $i++) {
+          for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 1
             $process.Refresh()
 
+            $combined = (Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog)
+
             if ($process.HasExited) {
               Write-Host "[ERROR] SSH exited with code $($process.ExitCode)"
-              if (Test-Path $log) { Get-Content $log -Tail 50 }
-              if (Test-Path $outLog) { Get-Content $outLog -Tail 50 }
+              Write-Host $combined
               throw "SSH connection failed."
             }
 
-            $combined = ""
-            if (Test-Path $log) { $combined += (Get-Content $log -Raw -ErrorAction SilentlyContinue) + "`n" }
-            if (Test-Path $outLog) { $combined += (Get-Content $outLog -Raw -ErrorAction SilentlyContinue) }
-
             if ($combined -match 'Allocated port (\d+) for remote forward') {
-              $allocatedPort = $Matches[1]
+              $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
+              break
+            }
+
+            if ($combined -match 'tnl\.suzlab\.com:(\d+)') {
+              $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
+              break
+            }
+
+            if ($combined -match 'remote forward success') {
+              $forwardConfirmed = $true
+            }
+
+            # Nếu server đã báo forward thành công nhưng dùng port cố định trên web dashboard
+            if ($forwardConfirmed -and $i -ge 3) {
+              $endpoint = "$($env:TUNNEL_HOST) (xem port trên dashboard)"
               break
             }
           }
 
-          if (-not $allocatedPort) {
-            Write-Host "[ERROR] Timeout waiting for allocated port. Last logs:"
-            if (Test-Path $log) { Get-Content $log -Tail 50 }
-            if (Test-Path $outLog) { Get-Content $outLog -Tail 50 }
-            throw "SuzLab did not return an allocated port."
+          if (-not $endpoint) {
+            Write-Host "[ERROR] Timeout waiting for tunnel. Logs:"
+            Write-Host ((Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog))
+            throw "SuzLab tunnel did not confirm port forwarding."
           }
 
-          "SUZLAB_ENDPOINT_PORT=$allocatedPort" >> $env:GITHUB_ENV
+          "SUZLAB_ENDPOINT=$endpoint" >> $env:GITHUB_ENV
 
           @(
             "## SuzLab Tunnel Endpoint"
             "| Field | Value |"
             "|---|---|"
-            "| Address | ``$($env:TUNNEL_HOST):$allocatedPort`` |"
+            "| Address | ``$endpoint`` |"
             "| Target | ``localhost:$($env:RDP_PORT)`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           Write-Host "======================================"
           Write-Host "SUZLAB TUNNEL CONNECTED"
-          Write-Host "Endpoint: $($env:TUNNEL_HOST):$allocatedPort"
+          Write-Host "Endpoint: $endpoint"
           Write-Host "======================================"
 
       # ==========================================
@@ -267,17 +296,13 @@ jobs:
           }
 
           $end = (Get-Date).AddMinutes($minutes)
-          $log = "$env:RUNNER_TEMP\suzlab-ssh.log"
-
-          Write-Host "Active Endpoint: $($env:TUNNEL_HOST):$env:SUZLAB_ENDPOINT_PORT"
+          Write-Host "Active Endpoint: $env:SUZLAB_ENDPOINT"
 
           while ((Get-Date) -lt $end) {
             $process = Get-Process -Id $env:SUZLAB_SSH_PID -ErrorAction SilentlyContinue
 
             if (-not $process) {
-              Write-Host "[ERROR] SSH process stopped unexpectedly."
-              if (Test-Path $log) { Get-Content $log -Tail 40 }
-              throw "SuzLab SSH tunnel disconnected."
+              throw "SuzLab SSH tunnel disconnected unexpectedly."
             }
 
             $remaining = [int]($end - (Get-Date)).TotalMinutes
@@ -312,7 +337,7 @@ jobs:
         with:
           name: suzlab-tunnel-diagnostics
           path: |
-            ${{ runner.temp }}/suzlab-ssh.log
+            ${{ runner.temp }}/suzlab-ssh-err.log
             ${{ runner.temp }}/suzlab-ssh-out.log
           if-no-files-found: ignore
           retention-days: 1
