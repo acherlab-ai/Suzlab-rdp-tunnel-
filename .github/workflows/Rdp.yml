@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   suzlab-demo:
-    name: "SuzLab SSH Reverse Tunnel"
+    name: "SuzLab Windows RDP"
     runs-on: windows-latest
     timeout-minutes: 345
 
@@ -26,119 +26,80 @@ jobs:
       TUNNEL_HOST: tnl.suzlab.com
       TUNNEL_PORT: "2222"
       RDP_PORT: "3389"
+      RDP_USER: "SUZLAB-DEMO"
 
     steps:
       # ==========================================
-      # 01 - WELCOME
+      # 01 - BẬT RDP & TẠO USER ĐĂNG NHẬP
       # ==========================================
-      - name: "01 - SuzLab Welcome"
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "     SUZLAB TUNNEL - RDP SERVICE"
-          Write-Host "======================================"
-          Write-Host "Host: $env:TUNNEL_HOST`:$env:TUNNEL_PORT | Duration: ${{ inputs.duration }}"
-
-      # ==========================================
-      # 02 - WINDOWS RDP (TỐI ƯU TCP & CHỐNG SLEEP)
-      # ==========================================
-      - name: "02 - Configure Windows RDP"
+      - name: "01 - Enable RDP & Create User"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tsPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
-          $rdpTcpPath = "$tsPath\WinStations\RDP-Tcp"
+          # Cấu hình Registry RDP (tắt NLA, chỉ dùng TCP)
+          $ts = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $ts -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path $tcp -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path $tcp -Name "SecurityLayer" -Value 1
+          New-ItemProperty -Path $tcp -Name "SelectTransport" -Value 1 -PropertyType DWord -Force | Out-Null
 
-          Set-ItemProperty -Path $tsPath -Name "fDenyTSConnections" -Value 0
-          Set-ItemProperty -Path $rdpTcpPath -Name "UserAuthentication" -Value 1
-          Set-ItemProperty -Path $rdpTcpPath -Name "SecurityLayer" -Value 2
-
-          # Ép RDP chạy thuần TCP (1 = TCP only) để không bị đứng hình qua SSH Tunnel
-          New-ItemProperty -Path $rdpTcpPath -Name "SelectTransport" -Value 1 -PropertyType DWord -Force | Out-Null
-
-          # Tắt chế độ ngủ của Windows trong phiên dài
+          # Chống sleep máy ảo
           powercfg /change standby-timeout-ac 0
           powercfg /change monitor-timeout-ac 0
 
+          # Mở Firewall & khởi động dịch vụ RDP
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "SuzLab-RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
           Set-Service TermService -StartupType Automatic
-          Start-Service TermService
+          Set-Service UmRdpService -StartupType Automatic
+          Start-Service TermService, UmRdpService
 
-          if ((Get-Service TermService).Status -ne "Running") {
-            throw "RDP service failed to start."
-          }
-
-          Write-Host "[OK] Windows RDP ready (TCP-optimized)."
-
-      # ==========================================
-      # 03 - RDP ACCOUNT
-      # ==========================================
-      - name: "03 - Create SuzLab Demo Account"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
+          # Tạo mật khẩu ngẫu nhiên mạnh
           $upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
           $lower = "abcdefghijkmnpqrstuvwxyz"
           $digits = "23456789"
           $all = $upper + $lower + $digits
-
           $chars = @(
             $upper[(Get-Random -Maximum $upper.Length)],
             $lower[(Get-Random -Maximum $lower.Length)],
-            $digits[(Get-Random -Maximum $digits.Length)]
+            $digits[(Get-Random -Maximum $digits.Length)],
+            "@"
           )
-          for ($i = 0; $i -lt 15; $i++) {
+          for ($i = 0; $i -lt 12; $i++) {
             $chars += $all[(Get-Random -Maximum $all.Length)]
           }
           $password = -join ($chars | Sort-Object { Get-Random })
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
 
-          if (Get-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "SUZLAB-DEMO"
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:RDP_USER
           }
 
-          New-LocalUser `
-            -Name "SUZLAB-DEMO" `
-            -Password $secure `
-            -Description "SuzLab Tunnel Demo" `
-            -AccountNeverExpires | Out-Null
+          New-LocalUser -Name $env:RDP_USER -Password $secure -Description "SuzLab RDP" -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SUZLAB-DEMO"
-
+          # Ghi ra Summary & in thẳng ra Log để copy trên điện thoại
           @(
-            "## SuzLab RDP Account"
-            "| Field | Value |"
+            "## Thong tin ket noi RDP"
+            "| Muc | Gia tri |"
             "|---|---|"
-            "| Username | ``SUZLAB-DEMO`` |"
+            "| Username | ``$($env:RDP_USER)`` |"
             "| Password | ``$password`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          Write-Host "[OK] Demo account created."
+          Write-Host "=========================================="
+          Write-Host "  RDP DA SAN SANG"
+          Write-Host "  Username : $($env:RDP_USER)"
+          Write-Host "  Password : $password"
+          Write-Host "=========================================="
 
       # ==========================================
-      # 04 - OPENSSH
+      # 02 - CHUẨN BỊ SSH & MẬT KHẨU TUNNEL
       # ==========================================
-      - name: "04 - Verify OpenSSH"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
-            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
-          }
-
-          if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
-            throw "OpenSSH installation failed."
-          }
-
-          Write-Host "[OK] OpenSSH ready."
-
-      # ==========================================
-      # 05 - SSH ASKPASS
-      # ==========================================
-      - name: "05 - Prepare SuzLab Authentication"
+      - name: "02 - Prepare SSH Tunnel"
         shell: pwsh
         env:
           SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
@@ -146,8 +107,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
+          }
+
           if ([string]::IsNullOrWhiteSpace($env:SUZLAB_TUNNEL_USER) -or [string]::IsNullOrWhiteSpace($env:SUZLAB_TUNNEL_PASSWORD)) {
-            throw "Missing SUZLAB_TUNNEL_USER or SUZLAB_TUNNEL_PASSWORD secrets."
+            throw "Thieu secret SUZLAB_TUNNEL_USER hoac SUZLAB_TUNNEL_PASSWORD."
           }
 
           $askpass = "$env:RUNNER_TEMP\suzlab-askpass.cmd"
@@ -158,12 +123,12 @@ jobs:
           ) | Set-Content -Path $askpass -Encoding ASCII
 
           "SUZLAB_ASKPASS=$askpass" >> $env:GITHUB_ENV
-          Write-Host "[OK] Authentication helper prepared."
+          Write-Host "[OK] SSH Tunnel ready."
 
       # ==========================================
-      # 06 - CONNECT & MAINTAIN TUNNEL (CHUNG 1 STEP)
+      # 03 - KẾT NỐI & GIỮ TUNNEL SUZLAB
       # ==========================================
-      - name: "06 - Connect & Maintain SuzLab Tunnel"
+      - name: "03 - Connect & Maintain SuzLab Tunnel"
         shell: pwsh
         env:
           SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
@@ -181,15 +146,13 @@ jobs:
           function Read-LogSafe {
             param([string]$Path)
             if (-not (Test-Path $Path)) { return "" }
-            $fs = $null
-            $sr = $null
+            $fs = $null; $sr = $null
             try {
               $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
               $sr = New-Object System.IO.StreamReader($fs)
               return $sr.ReadToEnd()
-            } catch {
-              return ""
-            } finally {
+            } catch { return "" }
+            finally {
               if ($sr) { $sr.Dispose() }
               if ($fs) { $fs.Dispose() }
             }
@@ -207,8 +170,7 @@ jobs:
           $sshArgs = @(
             "-v",
             "-p", $env:TUNNEL_PORT,
-            "-N",
-            "-T",
+            "-N", "-T",
             "-o", "BatchMode=no",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "PreferredAuthentications=password,keyboard-interactive",
@@ -224,112 +186,67 @@ jobs:
             "$($env:SUZLAB_TUNNEL_USER)@$($env:TUNNEL_HOST)"
           )
 
-          function Start-SuzLabTunnel {
+          function Start-Tunnel {
             Remove-Item $errLog, $outLog -Force -ErrorAction SilentlyContinue
+            $proc = Start-Process -FilePath "ssh.exe" -ArgumentList $sshArgs `
+              -RedirectStandardInput $emptyIn -RedirectStandardOutput $outLog `
+              -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
 
-            $proc = Start-Process `
-              -FilePath "ssh.exe" `
-              -ArgumentList $sshArgs `
-              -RedirectStandardInput $emptyIn `
-              -RedirectStandardOutput $outLog `
-              -RedirectStandardError $errLog `
-              -WindowStyle Hidden `
-              -PassThru
-
-            $resolvedEndpoint = $null
+            $endpoint = $null
             $forwardOk = $false
 
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Seconds 1
               $proc.Refresh()
-
               $combined = (Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog)
 
               if ($proc.HasExited) {
-                Write-Host "[ERROR] SSH exited with code $($proc.ExitCode)"
                 Write-Host $combined
                 return $null
               }
-
               if ($combined -match 'Allocated port (\d+) for remote forward' -and $Matches[1] -ne $env:TUNNEL_PORT) {
-                $resolvedEndpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
-                break
+                $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"; break
               }
-
               if ($combined -match 'tnl\.suzlab\.com:(\d+)' -and $Matches[1] -ne $env:TUNNEL_PORT) {
-                $resolvedEndpoint = "$($env:TUNNEL_HOST):$($Matches[1])"
-                break
+                $endpoint = "$($env:TUNNEL_HOST):$($Matches[1])"; break
               }
-
-              if ($combined -match 'remote forward success') {
-                $forwardOk = $true
-              }
-
+              if ($combined -match 'remote forward success') { $forwardOk = $true }
               if ($forwardOk -and $i -ge 2) {
-                $resolvedEndpoint = "$($env:TUNNEL_HOST) (dùng port trên dashboard SuzLab)"
+                $endpoint = "$($env:TUNNEL_HOST):31000 (hoac xem port tren dashboard)"
                 break
               }
             }
 
-            if (-not $resolvedEndpoint) {
-              Write-Host "[ERROR] Timeout waiting for tunnel. Logs:"
-              Write-Host ((Read-LogSafe $errLog) + "`n" + (Read-LogSafe $outLog))
+            if (-not $endpoint) {
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
               return $null
             }
-
-            return @{
-              Process  = $proc
-              Endpoint = $resolvedEndpoint
-            }
+            return @{ Process = $proc; Endpoint = $endpoint }
           }
 
-          $session = Start-SuzLabTunnel
-          if (-not $session) {
-            throw "Initial SuzLab SSH tunnel connection failed."
-          }
+          $session = Start-Tunnel
+          if (-not $session) { throw "Ket noi SSH Tunnel that bai." }
 
           $process = $session.Process
-          $endpoint = $session.Endpoint
-
-          @(
-            "## SuzLab Tunnel Endpoint"
-            "| Field | Value |"
-            "|---|---|"
-            "| Address | ``$endpoint`` |"
-            "| Target | ``localhost:$($env:RDP_PORT)`` |"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-          Write-Host "======================================"
-          Write-Host "SUZLAB TUNNEL CONNECTED"
-          Write-Host "Endpoint: $endpoint"
-          Write-Host "======================================"
+          Write-Host "=========================================="
+          Write-Host "  TUNNEL DA THONG: $($session.Endpoint)"
+          Write-Host "=========================================="
 
           $end = (Get-Date).AddMinutes($minutes)
-
           try {
             while ((Get-Date) -lt $end) {
               $process.Refresh()
-
               if ($process.HasExited) {
-                Write-Host "[WARN] SSH tunnel dropped (exit code $($process.ExitCode)). Reconnecting in 3s..."
+                Write-Host "[WARN] Mat ket noi tunnel, dang ket noi lai..."
                 Start-Sleep -Seconds 3
-
-                $retry = Start-SuzLabTunnel
-                if (-not $retry) {
-                  throw "Failed to reconnect SuzLab SSH tunnel."
-                }
+                $retry = Start-Tunnel
+                if (-not $retry) { throw "Khong the ket noi lai tunnel." }
                 $process = $retry.Process
-                Write-Host "[OK] Reconnected: $($retry.Endpoint)"
               }
-
               $remaining = [int]($end - (Get-Date)).TotalMinutes
-              Write-Host "[$(Get-Date -Format HH:mm:ss)] Tunnel active | $remaining min remaining"
-
+              Write-Host "[$(Get-Date -Format HH:mm:ss)] RDP & Tunnel hoat dong | Con lai $remaining phut"
               Start-Sleep -Seconds 30
             }
-
-            Write-Host "[SuzLab] Session expired."
           } finally {
             if ($process -and -not $process.HasExited) {
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -337,27 +254,12 @@ jobs:
           }
 
       # ==========================================
-      # 07 - CLEANUP
+      # 04 - DỌN DẸP
       # ==========================================
-      - name: "07 - Cleanup SuzLab Session"
+      - name: "04 - Cleanup"
         if: always()
         shell: pwsh
         run: |
           Get-Process -Name "ssh" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Disable-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue
+          Disable-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
           Remove-Item "$env:RUNNER_TEMP\suzlab-askpass.cmd", "$env:RUNNER_TEMP\suzlab-empty.in" -Force -ErrorAction SilentlyContinue
-          Write-Host "[SuzLab] Cleanup completed."
-
-      # ==========================================
-      # 08 - DEBUG LOG (CHỈ UPLOAD KHI LỖI)
-      # ==========================================
-      - name: "08 - Upload SSH Diagnostics"
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: suzlab-tunnel-diagnostics
-          path: |
-            ${{ runner.temp }}/suzlab-ssh-err.log
-            ${{ runner.temp }}/suzlab-ssh-out.log
-          if-no-files-found: ignore
-          retention-days: 1
