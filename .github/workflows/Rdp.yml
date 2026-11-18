@@ -1,0 +1,252 @@
+
+name: "SuzLab Tunnel - RDP Demo"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Tunnel session duration"
+        required: true
+        default: "3h"
+        type: choice
+        options:
+          - "1h"
+          - "3h"
+          - "5h40m"
+
+permissions:
+  contents: read
+
+jobs:
+  suzlab-tunnel:
+    name: "SuzLab SSH Reverse Tunnel"
+    runs-on: windows-latest
+    timeout-minutes: 340
+
+    env:
+      TUNNEL_HOST: tnl.suzlab.com
+      TUNNEL_PORT: "2222"
+      RDP_PORT: "3389"
+
+    steps:
+      - name: "01 - SuzLab Welcome"
+        shell: pwsh
+        run: |
+          Write-Host "===================================="
+          Write-Host "       SUZLAB TUNNEL DEMO"
+          Write-Host "       SSH REVERSE TUNNEL"
+          Write-Host "===================================="
+          Write-Host "Host: $env:TUNNEL_HOST"
+          Write-Host "SSH Port: $env:TUNNEL_PORT"
+          Write-Host "RDP Port: $env:RDP_PORT"
+          Write-Host "Duration: ${{ inputs.duration }}"
+
+      - name: "02 - Configure RDP"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+          Write-Host "[OK] RDP enabled."
+
+      - name: "03 - Create RDP Account"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+          $lower = "abcdefghijkmnpqrstuvwxyz"
+          $digits = "23456789"
+          $all = $upper + $lower + $digits
+
+          $password = ""
+          $password += $upper[(Get-Random -Maximum $upper.Length)]
+          $password += $lower[(Get-Random -Maximum $lower.Length)]
+          $password += $digits[(Get-Random -Maximum $digits.Length)]
+
+          for ($i = 0; $i -lt 17; $i++) {
+            $password += $all[(Get-Random -Maximum $all.Length)]
+          }
+
+          $password = -join ($password.ToCharArray() | Sort-Object { Get-Random })
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $old = Get-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue
+
+          if ($old) {
+            Remove-LocalUser -Name "SUZLAB-DEMO"
+          }
+
+          New-LocalUser `
+            -Name "SUZLAB-DEMO" `
+            -Password $secure `
+            -Description "SuzLab Tunnel Demo" `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "SUZLAB-DEMO"
+
+          "## SuzLab RDP Credentials" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Field | Value |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "|---|---|" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Username | SUZLAB-DEMO |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Password | $password |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+          Write-Host "[OK] RDP account created."
+
+      - name: "04 - Install OpenSSH"
+        shell: pwsh
+        run: |
+          $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+
+          if (-not $ssh) {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          }
+
+          if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
+            throw "OpenSSH installation failed."
+          }
+
+          Write-Host "[OK] OpenSSH ready."
+
+      - name: "05 - Connect SuzLab Tunnel"
+        shell: pwsh
+        env:
+          SUZLAB_TUNNEL_USER: ${{ secrets.SUZLAB_TUNNEL_USER }}
+          SUZLAB_TUNNEL_PASSWORD: ${{ secrets.SUZLAB_TUNNEL_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:SUZLAB_TUNNEL_USER -or
+              -not $env:SUZLAB_TUNNEL_PASSWORD) {
+            throw "Missing SuzLab SSH credentials."
+          }
+
+          $askpass = Join-Path $env:RUNNER_TEMP "suzlab-askpass.cmd"
+
+          @'
+          @echo off
+          echo %SUZLAB_TUNNEL_PASSWORD%
+          '@ | Set-Content $askpass -Encoding ASCII
+
+          $env:SSH_ASKPASS = $askpass
+          $env:SSH_ASKPASS_REQUIRE = "force"
+          $env:DISPLAY = "suzlab"
+
+          $sshArgs = @(
+            "-p", "2222",
+            "-N",
+            "-T",
+            "-o", "BatchMode=no",
+            "-o", "NumberOfPasswordPrompts=1",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-R", "0:localhost:3389",
+            "$($env:SUZLAB_TUNNEL_USER)@tnl.suzlab.com"
+          )
+
+          $process = Start-Process `
+            -FilePath "ssh.exe" `
+            -ArgumentList $sshArgs `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardError "$env:RUNNER_TEMP\suzlab-ssh.log"
+
+          "SUZLAB_SSH_PID=$($process.Id)" >> $env:GITHUB_ENV
+
+          $allocatedPort = $null
+
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($process.HasExited) {
+              Get-Content "$env:RUNNER_TEMP\suzlab-ssh.log"
+              throw "SuzLab SSH connection failed."
+            }
+
+            $log = Get-Content "$env:RUNNER_TEMP\suzlab-ssh.log" -Raw -ErrorAction SilentlyContinue
+
+            if ($log -match 'Allocated port (\d+) for remote forward') {
+              $allocatedPort = $Matches[1]
+              break
+            }
+          }
+
+          if (-not $allocatedPort) {
+            throw "Tunnel port allocation not detected. Check server configuration."
+          }
+
+          "SUZLAB_ENDPOINT_PORT=$allocatedPort" >> $env:GITHUB_ENV
+
+          "## SuzLab Tunnel Connected" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Field | Value |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "|---|---|" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Host | tnl.suzlab.com |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| Port | $allocatedPort |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "| RDP | localhost:3389 |" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+          Write-Host "[OK] SuzLab Tunnel connected."
+          Write-Host "Allocated endpoint: $allocatedPort"
+
+      - name: "06 - Maintain Tunnel"
+        shell: pwsh
+        run: |
+          $minutes = switch ("${{ inputs.duration }}") {
+            "1h" { 60 }
+            "3h" { 180 }
+            "5h40m" { 340 }
+            default { throw "Invalid duration." }
+          }
+
+          $end = (Get-Date).AddMinutes($minutes)
+
+          Write-Host "SuzLab endpoint: tnl.suzlab.com:$env:SUZLAB_ENDPOINT_PORT"
+
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+
+            if (-not (Get-Process -Id $env:SUZLAB_SSH_PID -ErrorAction SilentlyContinue)) {
+              throw "SuzLab Tunnel disconnected."
+            }
+
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] Active - $([int]$remaining.TotalMinutes) minutes remaining"
+
+            Start-Sleep -Seconds 15
+          }
+
+          Write-Host "Session expired."
+
+      - name: "07 - Cleanup"
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[SuzLab] Cleaning up..."
+
+          if ($env:SUZLAB_SSH_PID) {
+            Stop-Process -Id $env:SUZLAB_SSH_PID -Force -ErrorAction SilentlyContinue
+          }
+
+          Disable-LocalUser -Name "SUZLAB-DEMO" -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:RUNNER_TEMP\suzlab-askpass.cmd" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:RUNNER_TEMP\suzlab-ssh.log" -Force -ErrorAction SilentlyContinue
+
+          Write-Host "[SuzLab] Cleanup completed."
